@@ -1511,6 +1511,253 @@ class ServiceTestCase(unittest.TestCase):
             self.assertEqual(len(service.list_acknowledgements(c, 1)), 1)
             self.assertIsNotNone(service.get_segment(c, 1))  # 旧段数据未受影响
 
+    def test_init_db_migration_rolls_back_keeps_legacy_table_usable(self):
+        # 迁移任一步失败（此处为复制历史时违反新表 NOT NULL）必须整体回滚：
+        # 旧表保持迁移前状态、可继续使用，且不留 segment_changes_old 残表
+        import sqlite3
+
+        legacy = os.path.join(self.tmp.name, "legacy_fail.db")
+        conn = sqlite3.connect(legacy)
+        conn.executescript(
+            """
+            CREATE TABLE segment_changes (
+                change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL CHECK (type IN ('upsert','merged')),
+                segment_id INTEGER NOT NULL, merged_into INTEGER, revision INTEGER,
+                source TEXT, start_ts REAL, end_ts REAL, max_severity TEXT,
+                event_count INTEGER, created_at REAL);  -- 旧卷变体：允许 NULL
+            """
+        )
+        conn.execute(
+            "INSERT INTO segment_changes (type, segment_id, revision, created_at) "
+            "VALUES ('upsert', 7, 1, NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        from app.db import init_db as _init
+
+        # 复制历史时 NULL created_at 违反新表 NOT NULL → 迁移失败，init_db 抛出
+        with self.assertRaises(sqlite3.IntegrityError):
+            _init(legacy)
+
+        conn = sqlite3.connect(legacy)
+        try:
+            # 旧表原样保留：旧 CHECK（无 'deleted'）、历史行未丢、无残表
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='segment_changes'"
+            ).fetchone()[0]
+            self.assertNotIn("'deleted'", sql)
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE name='segment_changes_old'"
+                ).fetchone()
+            )
+            row = conn.execute(
+                "SELECT change_id, type, segment_id, created_at "
+                "FROM segment_changes"
+            ).fetchone()
+            self.assertEqual(tuple(row), (1, "upsert", 7, None))
+            # 旧表可继续使用：旧约束允许的写入照常成功，越界写入仍被拒绝
+            conn.execute(
+                "INSERT INTO segment_changes (type, segment_id, created_at) "
+                "VALUES ('merged', 8, 2.0)"
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO segment_changes (type, segment_id, created_at) "
+                    "VALUES ('deleted', 8, 3.0)"
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 数据修复后重试：迁移成功，历史（含修复行与回滚后补写的行）完整保留
+        conn = sqlite3.connect(legacy)
+        conn.execute(
+            "UPDATE segment_changes SET created_at = 1.0 WHERE change_id = 1"
+        )
+        conn.commit()
+        conn.close()
+        _init(legacy)
+        conn = sqlite3.connect(legacy)
+        try:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='segment_changes'"
+            ).fetchone()[0]
+            self.assertIn("'deleted'", sql)
+            rows = conn.execute(
+                "SELECT change_id, type, segment_id FROM segment_changes "
+                "ORDER BY change_id"
+            ).fetchall()
+            self.assertEqual(rows, [(1, "upsert", 7), (2, "merged", 8)])
+        finally:
+            conn.close()
+
+    def test_init_db_migration_change_id_continues_from_history_max(self):
+        # 迁移后新变更号接续历史最大值：历史占用 1..3，迁移后新写入从 4 起
+        import sqlite3
+
+        legacy = os.path.join(self.tmp.name, "legacy_seq.db")
+        conn = sqlite3.connect(legacy)
+        conn.executescript(
+            """
+            CREATE TABLE segment_changes (
+                change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL CHECK (type IN ('upsert','merged')),
+                segment_id INTEGER NOT NULL, merged_into INTEGER, revision INTEGER,
+                source TEXT, start_ts REAL, end_ts REAL, max_severity TEXT,
+                event_count INTEGER, created_at REAL NOT NULL);
+            """
+        )
+        conn.executemany(
+            "INSERT INTO segment_changes "
+            "(type, segment_id, merged_into, revision, source, start_ts, "
+            " end_ts, max_severity, event_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [("upsert", 7, None, 1, "s0", 100.0, 105.0, "info", 2, 1.0),
+             ("merged", 8, 7, None, None, None, None, None, None, 2.0),
+             ("upsert", 7, None, 2, "s0", 100.0, 109.0, "warning", 4, 3.0)],
+        )
+        conn.commit()
+        conn.close()
+
+        from app.db import init_db as _init
+
+        _init(legacy)
+
+        # 迁移后经正常业务路径写入新变更：change_id 接续历史最大值，历史原样保留
+        with session(legacy) as c:
+            c.execute("BEGIN IMMEDIATE")
+            service.ingest_event(
+                c, source="s1", event_id="e1", occurred_ts=1000.0,
+                severity="info", silence=SILENCE,
+            )
+        with session(legacy) as c:
+            c.execute("BEGIN IMMEDIATE")
+            service.ingest_event(
+                c, source="s2", event_id="e1", occurred_ts=1000.0,
+                severity="info", silence=SILENCE,
+            )
+        with session(legacy) as c:
+            page = service.list_segment_changes(c, after=0, limit=100)
+        self.assertEqual(
+            [ch["change_id"] for ch in page["changes"]], [1, 2, 3, 4, 5]
+        )
+        self.assertEqual(
+            [ch["type"] for ch in page["changes"]],
+            ["upsert", "merged", "upsert", "upsert", "upsert"],
+        )
+
+    def test_init_db_migration_preserves_segments_events_and_queries(self):
+        # 旧卷上的事件、段与历史变更在迁移后保持可查：
+        # 段详情/事件审计/变更流/水位快照均照常工作
+        import sqlite3
+
+        legacy = os.path.join(self.tmp.name, "legacy_full.db")
+        conn = sqlite3.connect(legacy)
+        conn.executescript(
+            """
+            CREATE TABLE segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL,
+                start_ts REAL NOT NULL, end_ts REAL NOT NULL,
+                max_severity TEXT NOT NULL, event_count INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL);
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                segment_id INTEGER NOT NULL REFERENCES segments (id),
+                source TEXT NOT NULL, event_id TEXT NOT NULL,
+                occurred_at REAL NOT NULL, severity TEXT NOT NULL,
+                received_at REAL NOT NULL, UNIQUE (source, event_id));
+            CREATE TABLE segment_changes (
+                change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL CHECK (type IN ('upsert','merged')),
+                segment_id INTEGER NOT NULL, merged_into INTEGER, revision INTEGER,
+                source TEXT, start_ts REAL, end_ts REAL, max_severity TEXT,
+                event_count INTEGER, created_at REAL NOT NULL);
+            """
+        )
+        conn.execute(
+            "INSERT INTO segments (id, source, start_ts, end_ts, max_severity, "
+            "event_count, revision, created_at, updated_at) "
+            "VALUES (7, 's1', 1000.0, 1005.0, 'warning', 2, 1, 1.0, 1.0)"
+        )
+        conn.executemany(
+            "INSERT INTO events (segment_id, source, event_id, occurred_at, "
+            "severity, received_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [(7, "s1", "e1", 1000.0, "warning", 1.0),
+             (7, "s1", "e2", 1005.0, "info", 1.0)],
+        )
+        conn.execute(
+            "INSERT INTO segment_changes "
+            "(type, segment_id, revision, source, start_ts, end_ts, "
+            " max_severity, event_count, created_at) "
+            "VALUES ('upsert', 7, 1, 's1', 1000.0, 1005.0, 'warning', 2, 1.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        from app.db import init_db as _init
+
+        _init(legacy)
+
+        with read_only_session(legacy) as c:
+            segment = service.get_segment(c, 7)
+            self.assertIsNotNone(segment)
+            self.assertEqual(segment["event_count"], 2)
+            events = service.list_events(c, source="s1")
+            self.assertEqual(
+                [e["event_id"] for e in events["events"]], ["e1", "e2"]
+            )
+            self.assertEqual(events["events"][0]["segment_id"], 7)
+            changes = service.list_segment_changes(c, after=0, limit=100)
+            self.assertEqual(
+                [(ch["change_id"], ch["type"]) for ch in changes["changes"]],
+                [(1, "upsert")],
+            )
+            snapshot = service.get_segment_snapshot(c, at_change_id=1)
+            self.assertEqual([s["id"] for s in snapshot["segments"]], [7])
+
+    def test_init_db_migrated_table_matches_fresh_definition(self):
+        # 迁移重建的 segment_changes 与全新建库的表定义逐字节一致
+        import sqlite3
+
+        legacy = os.path.join(self.tmp.name, "legacy_ddl.db")
+        conn = sqlite3.connect(legacy)
+        conn.executescript(
+            """
+            CREATE TABLE segment_changes (
+                change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL CHECK (type IN ('upsert','merged')),
+                segment_id INTEGER NOT NULL, merged_into INTEGER, revision INTEGER,
+                source TEXT, start_ts REAL, end_ts REAL, max_severity TEXT,
+                event_count INTEGER, created_at REAL NOT NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        from app.db import init_db as _init
+
+        _init(legacy)
+
+        def _ddl(path):
+            conn = sqlite3.connect(path)
+            try:
+                return conn.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='table' AND name='segment_changes'"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+        # setUp 已在 self.db_path 上执行过全新建库的 init_db，直接作为对照
+        self.assertEqual(_ddl(legacy), _ddl(self.db_path))
+
 
 class MaintenanceWindowTestCase(unittest.TestCase):
     def setUp(self):

@@ -104,19 +104,45 @@ CREATE TABLE IF NOT EXISTS escalation_policy_rules (
 """
 
 
+def _segment_changes_create_sql() -> str:
+    """从 SCHEMA 提取 segment_changes 建表语句（去掉 IF NOT EXISTS）。
+
+    迁移建新表必须与全新建库共用同一份定义（单一事实来源），避免两处漂移；
+    sqlite_master 存储的建表 SQL 本就不含 IF NOT EXISTS，因此迁移得到的表
+    定义与全新建库逐字节一致。调用方保证目标表不存在，故无需 IF NOT EXISTS。
+    """
+    marker = "CREATE TABLE IF NOT EXISTS segment_changes ("
+    start = SCHEMA.index(marker)
+    end = SCHEMA.index("\n);", start) + len("\n);")
+    return SCHEMA[start:end].replace(marker, "CREATE TABLE segment_changes (", 1)
+
+
 def _migrate_segment_changes(conn: sqlite3.Connection) -> None:
-    """旧库 segment_changes 的 CHECK 仅允许 upsert/merged 时重建为含 deleted 的新表。
+    """旧库 segment_changes 的 CHECK 仅允许 upsert/merged 时，在单个显式事务内
+    重建为含 deleted 的新表并原子替换。
 
     撤回功能新增 'deleted' 墓碑类型；CREATE TABLE IF NOT EXISTS 不会更新已有
-    持久化卷上的旧 CHECK 约束，故检测旧表 SQL 并在一次性事务内重建
-    （SQLite 无法直接 ALTER CHECK）。历史记录按原序保留，change_id 不变。
+    持久化卷上的旧 CHECK 约束，而 SQLite 无法直接 ALTER CHECK，故检测旧表
+    SQL 后按"改名旧表 → 建新表 → 按原 change_id 复制历史 → 删除旧表"迁移：
+
+    - 全部步骤在同一个 BEGIN IMMEDIATE 显式事务内执行，任一步失败整体
+      ROLLBACK，旧表原样保留、可继续使用；
+    - 绝不使用 executescript：它会先隐式 COMMIT 挂起的事务，把半截迁移
+      （旧表已改名、新表未复制）直接落盘，破坏原子性；
+    - 历史记录按原 change_id 逐行复制，AUTOINCREMENT 序列随历史最大值推进，
+      迁移后新变更号接续历史最大值；
+    - 迁移后表 SQL 含 'deleted'，重复启动时检测跳过，不会重复迁移。
     """
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='segment_changes'"
     ).fetchone()
-    if row is not None and "'deleted'" not in row["sql"]:
+    if row is None or "'deleted'" in row["sql"]:
+        return  # 表不存在（全新库由 SCHEMA 建好）或已是新约束：无需迁移
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
         conn.execute("ALTER TABLE segment_changes RENAME TO segment_changes_old")
-        conn.executescript(SCHEMA)  # 以新 CHECK 建 segment_changes
+        conn.execute(_segment_changes_create_sql())  # 以新 CHECK 建 segment_changes
         conn.execute(
             """
             INSERT INTO segment_changes
@@ -129,13 +155,29 @@ def _migrate_segment_changes(conn: sqlite3.Connection) -> None:
             """
         )
         conn.execute("DROP TABLE segment_changes_old")
+        conn.commit()
+    except Exception:
+        conn.rollback()  # 任一步失败：整体回滚，旧表保持迁移前状态
+        raise
 
 
 def init_db(db_path: str) -> None:
-    """建表并执行幂等迁移；Docker 启动时即完成数据库初始化。"""
-    with connect(db_path) as conn:
+    """建表并执行幂等迁移；Docker 启动时即完成数据库初始化。
+
+    先以 executescript 幂等建齐所有表（全新库建表 / 为旧卷补齐新增表），
+    再对旧版 segment_changes 做约束升级；迁移在自带的显式事务内完成，
+    失败回滚到可继续使用的旧表，重复启动不会重复迁移。
+    """
+    conn = connect(db_path)
+    try:
         conn.executescript(SCHEMA)
         _migrate_segment_changes(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def connect(db_path: str) -> sqlite3.Connection:

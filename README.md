@@ -14,6 +14,16 @@ docker compose up --build
 
 数据库文件在首次启动时自动建表初始化，并通过命名卷 `alerts-data` 持久化。
 
+### 数据卷升级（segment_changes 约束迁移）
+
+旧版本数据卷中 `segment_changes` 表的 `CHECK` 约束仅允许 `upsert`/`merged` 两种变更类型，不支持撤回功能引入的 `deleted` 墓碑。服务启动时（`init_db`，随上面的同一条启动命令自动执行）会检测旧表并在需要时原地升级，**无需任何手工操作**：
+
+- 升级在**单个显式事务**（`BEGIN IMMEDIATE`）内完成：建立支持 `deleted` 的新表 → 按原 `change_id` 逐行复制历史 → 原子换名替换 → 删除旧表；
+- 任一步失败**整体回滚**，旧表保持迁移前状态、可继续使用；修复数据后重启容器即可自动重试；
+- 迁移后新变更号**接续历史最大值**（`AUTOINCREMENT` 序列随复制推进），历史记录的 `change_id` 原样保留；
+- 迁移**幂等**：重复启动检测到新约束即跳过，不会重复迁移；
+- 已有事件、段、确认记录与全部查询接口（事件审计、变更流、水位快照等）在升级后照常可用。
+
 ## 配置项
 
 均通过环境变量配置（可在 `docker-compose.yml` 的 `environment` 中修改）：
@@ -655,7 +665,7 @@ app/
   service.py   # 归段/合并/去重/撤回核心逻辑、事件审计查询、时间桶统计、严重性序列模式指纹、持续时长分布报告、变更水位快照、维护窗口与告警升级策略
   schemas.py   # 请求/响应模型与校验
   severity.py  # 告警级别定义、排序与 canonical 级别表
-  db.py        # SQLite 连接、schema、事务
+  db.py        # SQLite 连接、schema、事务与旧卷 segment_changes 约束迁移
   config.py    # 环境变量配置
 tests/         # 单元测试与 API 测试
 Dockerfile / docker-compose.yml
