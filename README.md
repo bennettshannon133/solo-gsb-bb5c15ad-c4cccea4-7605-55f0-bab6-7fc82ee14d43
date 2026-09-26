@@ -4,15 +4,23 @@
 
 ## 快速开始
 
-一条命令完成依赖安装、数据库初始化与服务启动：
+一条命令完成镜像构建、数据库初始化（含旧数据卷自动升级）与服务启动：
 
 ```bash
 docker compose up --build
 ```
 
-服务地址：**http://localhost:8000**（交互式 API 文档：http://localhost:8000/docs）
+服务地址：**http://localhost:8000**（容器端口 `8000` 映射到宿主机 `8000`；交互式 API 文档：http://localhost:8000/docs，健康检查：http://localhost:8000/healthz）
 
-数据库文件在首次启动时自动建表初始化，并通过命名卷 `alerts-data` 持久化。
+数据库文件在首次启动时自动建表初始化，并通过命名卷 `alerts-data` 持久化（容器内路径 `/data/alerts.db`），`docker compose down` 后数据不丢失。
+
+### 数据卷升级（旧版 segment_changes 约束）
+
+撤回功能为变更流新增了 `deleted` 墓碑类型，而旧版数据卷上 `segment_changes` 的 `CHECK` 约束仅允许 `upsert`/`merged`。**无需任何人工操作**：服务启动（`docker compose up`）时 `init_db` 会自动检测旧约束并在**一个显式事务**内完成升级——旧表改名 → 以新约束（含 `deleted`）建新表 → 按原 `change_id` 顺序复制全部历史 → 删除旧表。
+
+- **原子性**：任一步失败整体回滚，旧表保持原样可用，修复问题后重启即可重试；升级事务内不使用会隐式提交的 `executescript`。
+- **幂等**：重复启动检测到新约束即跳过，不会重复迁移；历史 `change_id` 原样保留，迁移后新变更号接续历史最大值。
+- **兼容性**：升级只重建 `segment_changes` 一张表，事件、段、确认记录、维护窗口与升级策略数据均不受影响，所有查询接口照常可用。
 
 ## 配置项
 

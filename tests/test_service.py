@@ -1511,6 +1511,148 @@ class ServiceTestCase(unittest.TestCase):
             self.assertEqual(len(service.list_acknowledgements(c, 1)), 1)
             self.assertIsNotNone(service.get_segment(c, 1))  # 旧段数据未受影响
 
+    def _make_legacy_changes_db(self, name, rows):
+        """构造只含 upsert/merged 旧 CHECK 的 segment_changes 旧卷并写入历史。"""
+        legacy = os.path.join(self.tmp.name, name)
+        conn = sqlite3.connect(legacy)
+        conn.executescript(
+            """
+            CREATE TABLE segment_changes (
+                change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL CHECK (type IN ('upsert','merged')),
+                segment_id INTEGER NOT NULL, merged_into INTEGER, revision INTEGER,
+                source TEXT, start_ts REAL, end_ts REAL, max_severity TEXT,
+                event_count INTEGER, created_at REAL NOT NULL);
+            """
+        )
+        conn.executemany(
+            "INSERT INTO segment_changes "
+            "(type, segment_id, merged_into, revision, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        return legacy
+
+    def test_init_db_migration_change_id_continues_from_history_max(self):
+        # 旧卷已有多条历史变更（最大 change_id = 3）
+        legacy = self._make_legacy_changes_db(
+            "legacy_seq.db",
+            [
+                ("upsert", 7, None, 1, 1.0),
+                ("merged", 8, 7, None, 2.0),
+                ("upsert", 7, None, 2, 3.0),
+            ],
+        )
+
+        from app.db import init_db as _init
+
+        _init(legacy)
+        _init(legacy)  # 重复启动不得重复迁移
+        _init(legacy)
+
+        conn = sqlite3.connect(legacy)
+        try:
+            # 历史按原 change_id 完整保留且只此一份（未重复复制）
+            rows = conn.execute(
+                "SELECT change_id, type, segment_id, merged_into, revision "
+                "FROM segment_changes ORDER BY change_id"
+            ).fetchall()
+            self.assertEqual(
+                rows,
+                [
+                    (1, "upsert", 7, None, 1),
+                    (2, "merged", 8, 7, None),
+                    (3, "upsert", 7, None, 2),
+                ],
+            )
+            # 无迁移临时表残留
+            names = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            ]
+            self.assertNotIn("segment_changes_old", names)
+            # 新变更号接续历史最大值（AUTOINCREMENT）
+            conn.execute(
+                "INSERT INTO segment_changes (type, segment_id, created_at) "
+                "VALUES ('deleted', 7, 4.0)"
+            )
+            new_id = conn.execute(
+                "SELECT MAX(change_id) FROM segment_changes"
+            ).fetchone()[0]
+            self.assertEqual(new_id, 4)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_init_db_migration_failure_rolls_back_to_usable_old_table(self):
+        # 旧卷含历史变更；注入故障使"复制历史"步骤在建新表之后失败
+        legacy = self._make_legacy_changes_db(
+            "legacy_rollback.db",
+            [("upsert", 7, None, 1, 1.0), ("merged", 8, 7, None, 2.0)],
+        )
+
+        from unittest import mock
+
+        from app.db import init_db as _init
+
+        # 新表 DDL 缺 merged_into 列 → INSERT ... SELECT 复制必然失败，
+        # 且失败发生在 RENAME 与 CREATE 之后，可检验事务是否整体回滚
+        bad_ddl = (
+            "CREATE TABLE segment_changes ("
+            "change_id INTEGER PRIMARY KEY AUTOINCREMENT)"
+        )
+        with mock.patch("app.db._SEGMENT_CHANGES_DDL", bad_ddl):
+            with self.assertRaises(sqlite3.OperationalError):
+                _init(legacy)
+
+        conn = sqlite3.connect(legacy)
+        try:
+            # 旧表原样可用：旧 CHECK 未变、历史完整、无临时表残留
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='segment_changes'"
+            ).fetchone()[0]
+            self.assertNotIn("'deleted'", sql)
+            rows = conn.execute(
+                "SELECT change_id, type FROM segment_changes ORDER BY change_id"
+            ).fetchall()
+            self.assertEqual(rows, [(1, "upsert"), (2, "merged")])
+            names = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            ]
+            self.assertNotIn("segment_changes_old", names)
+            # 旧约束下仍可正常写入（表保持可用）
+            conn.execute(
+                "INSERT INTO segment_changes (type, segment_id, created_at) "
+                "VALUES ('upsert', 9, 3.0)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 故障解除后重试：迁移可成功完成，历史（含回滚后写入的一条）完整迁移
+        _init(legacy)
+        conn = sqlite3.connect(legacy)
+        try:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='segment_changes'"
+            ).fetchone()[0]
+            self.assertIn("'deleted'", sql)
+            count = conn.execute(
+                "SELECT COUNT(*) FROM segment_changes"
+            ).fetchone()[0]
+            self.assertEqual(count, 3)
+        finally:
+            conn.close()
+
 
 class MaintenanceWindowTestCase(unittest.TestCase):
     def setUp(self):

@@ -5,6 +5,24 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+# 段变更流 DDL 单独抽出为常量：旧卷迁移须在一个显式事务内逐条执行 DDL，
+# 不能使用会隐式提交的 executescript；与 SCHEMA 共用同一份定义避免两处漂移
+_SEGMENT_CHANGES_DDL = """
+CREATE TABLE IF NOT EXISTS segment_changes (
+    change_id    INTEGER PRIMARY KEY AUTOINCREMENT,  -- 单调递增的变更序号（分页游标）
+    type         TEXT    NOT NULL CHECK (type IN ('upsert', 'merged', 'deleted')),
+    segment_id   INTEGER NOT NULL,          -- upsert: 目标段；merged/deleted: 被删除段
+    merged_into  INTEGER,                   -- 仅 merged：指向保留段 id
+    revision     INTEGER,                   -- 仅 upsert：变更后的 revision
+    source       TEXT,                      -- 以下仅 upsert：变更时刻的段快照
+    start_ts     REAL,
+    end_ts       REAL,
+    max_severity TEXT,
+    event_count  INTEGER,
+    created_at   REAL    NOT NULL
+);
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS segments (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,19 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_events_segment ON events (segment_id);
 CREATE INDEX IF NOT EXISTS idx_events_source_time ON events (source, occurred_at, event_id);
 
 -- 段变更流：供下游增量同步。与事件写入同事务追加，change_id 单调递增
-CREATE TABLE IF NOT EXISTS segment_changes (
-    change_id    INTEGER PRIMARY KEY AUTOINCREMENT,  -- 单调递增的变更序号（分页游标）
-    type         TEXT    NOT NULL CHECK (type IN ('upsert', 'merged', 'deleted')),
-    segment_id   INTEGER NOT NULL,          -- upsert: 目标段；merged/deleted: 被删除段
-    merged_into  INTEGER,                   -- 仅 merged：指向保留段 id
-    revision     INTEGER,                   -- 仅 upsert：变更后的 revision
-    source       TEXT,                      -- 以下仅 upsert：变更时刻的段快照
-    start_ts     REAL,
-    end_ts       REAL,
-    max_severity TEXT,
-    event_count  INTEGER,
-    created_at   REAL    NOT NULL
-);
+""" + _SEGMENT_CHANGES_DDL + """
 -- 查询模式为 WHERE change_id > ? ORDER BY change_id，主键即索引，无需额外索引
 
 -- 人工确认审计：追加式不可变记录，确认序号 id 全局单调递增。
@@ -108,15 +114,22 @@ def _migrate_segment_changes(conn: sqlite3.Connection) -> None:
     """旧库 segment_changes 的 CHECK 仅允许 upsert/merged 时重建为含 deleted 的新表。
 
     撤回功能新增 'deleted' 墓碑类型；CREATE TABLE IF NOT EXISTS 不会更新已有
-    持久化卷上的旧 CHECK 约束，故检测旧表 SQL 并在一次性事务内重建
-    （SQLite 无法直接 ALTER CHECK）。历史记录按原序保留，change_id 不变。
+    持久化卷上的旧 CHECK 约束，故检测旧表 SQL 并重建（SQLite 无法直接 ALTER
+    CHECK）。整个重建在**一个显式事务**内完成：旧表改名 → 以新 CHECK 建新表 →
+    按原 change_id 顺序复制历史 → 删除旧表，任一步失败整体回滚、旧表保持
+    可用。事务内绝不调用会隐式提交的 executescript（否则改名会被提前落盘，
+    后续失败将无法回滚）。历史记录 change_id 原样保留，AUTOINCREMENT 使迁移后
+    新变更号接续历史最大值；重复启动检测到新 CHECK 即跳过，不会重复迁移。
     """
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='segment_changes'"
     ).fetchone()
-    if row is not None and "'deleted'" not in row["sql"]:
+    if row is None or "'deleted'" in row["sql"]:
+        return  # 新库或已完成迁移：幂等跳过
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("ALTER TABLE segment_changes RENAME TO segment_changes_old")
-        conn.executescript(SCHEMA)  # 以新 CHECK 建 segment_changes
+        conn.execute(_SEGMENT_CHANGES_DDL)  # 以新 CHECK 建 segment_changes
         conn.execute(
             """
             INSERT INTO segment_changes
@@ -129,10 +142,21 @@ def _migrate_segment_changes(conn: sqlite3.Connection) -> None:
             """
         )
         conn.execute("DROP TABLE segment_changes_old")
+    except Exception:
+        conn.rollback()  # 任一步失败：整体回滚，旧表原样可用
+        raise
+    else:
+        conn.commit()
 
 
 def init_db(db_path: str) -> None:
-    """建表并执行幂等迁移；Docker 启动时即完成数据库初始化。"""
+    """建表并执行幂等迁移；Docker 启动时即完成数据库初始化。
+
+    顺序保证：先以 executescript 幂等建齐所有新表（旧卷上已存在的
+    segment_changes 保持旧 CHECK 不变），再由 _migrate_segment_changes 在
+    **独立的显式事务**内完成旧表重建——executescript 的隐式提交发生在迁移
+    事务开始之前，不会破坏其原子性。重复调用安全（幂等）。
+    """
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
         _migrate_segment_changes(conn)
